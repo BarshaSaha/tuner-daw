@@ -360,7 +360,7 @@ export default function Home() {
     <main style={{ maxWidth: 980, margin: "0 auto", padding: 24, fontFamily: "system-ui, sans-serif" }}>
       <h1 style={{ marginBottom: 8 }}>Tuner → Instrument Converter (Browser-only Demo)</h1>
       <p style={{ marginTop: 0, color: "#444" }}>
-        Record or upload a <b>single-voice / single-instrument</b> melody. We track pitch like a tuner, segment notes, play a chosen synth, and export MIDI/WAV.
+        Record or upload a <b>single-voice / single-instrument</b> melody.
       </p>
 
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center", marginBottom: 16 }}>
@@ -527,7 +527,7 @@ export default function Home() {
           </div>
 
           <small style={{ display: "block", marginTop: 10, color: "#777" }}>
-            Instrument changes won’t auto-play anymore. Press Play to hear the selected instrument.
+            Press Play to hear the selected instrument.
           </small>
         </section>
       </div>
