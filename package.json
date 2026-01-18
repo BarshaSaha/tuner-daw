@@ -10,7 +10,8 @@
   "dependencies": {
     "next": "14.2.5",
     "react": "18.3.1",
-    "react-dom": "18.3.1"
+    "react-dom": "18.3.1",
+    "soundfont-player": "0.15.7"
   },
 "devDependencies": {
   "typescript": "5.5.4",
