@@ -1,18 +1,27 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import Soundfont from "soundfont-player";
+
 import { decodeAudioToMono } from "../lib/audio/decode";
 import { yinPitch, rms } from "../lib/pitch/yin";
 import { framesToNotes, midiToName, type NoteEvent, type PitchFrame } from "../lib/notes/segment";
 import { downloadMidi } from "../lib/midi/export";
-import { downloadBlob, renderNotesToWavBlob, type SynthType } from "../lib/wav/render";
+import { downloadBlob, renderNotesToWavBlob } from "../lib/wav/render";
 
 type Mode = "idle" | "recording" | "analyzed";
+type QuantizeGrid = "off" | "1/8" | "1/16";
 
 const MAX_RECORD_SECONDS = 10;
 
 export default function Home() {
   const [mode, setMode] = useState<Mode>("idle");
   const [bpm, setBpm] = useState<number>(120);
-  const [synth, setSynth] = useState<SynthType>("triangle");
+
+  // Quantize makes BPM meaningful
+  const [quantize, setQuantize] = useState<QuantizeGrid>("1/16");
+
+  // Realistic instruments (SoundFont names)
+  const [instrumentName, setInstrumentName] = useState<string>("acoustic_grand_piano");
+
   const [frames, setFrames] = useState<PitchFrame[]>([]);
   const [notes, setNotes] = useState<NoteEvent[]>([]);
   const [status, setStatus] = useState<string>("Ready");
@@ -27,15 +36,23 @@ export default function Home() {
   const [elapsed, setElapsed] = useState<number>(0);
   const timerRef = useRef<number | null>(null);
 
-  // Playback state
+  // Playback state (SoundFont)
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const playingNodesRef = useRef<{ osc: OscillatorNode; gain: GainNode }[]>([]);
+  const playingNodesRef = useRef<any[]>([]); // Soundfont nodes
   const [isPlaying, setIsPlaying] = useState(false);
-  const playStartWallRef = useRef<number>(0);     // wall-clock when play started
-  const playOffsetRef = useRef<number>(0);        // seconds into the piece (for pause/resume)
-  const pieceDuration = useMemo(() => (notes.length ? Math.max(...notes.map(n => n.end)) : 0), [notes]);
+  const playStartWallRef = useRef<number>(0);
+  const playOffsetRef = useRef<number>(0);
 
-  // Tuner display
+  // Instrument caching
+  const instrumentRef = useRef<any>(null);
+  const loadingInstrumentRef = useRef<Promise<any> | null>(null);
+
+  const pieceDuration = useMemo(
+    () => (notes.length ? Math.max(...notes.map((n) => n.end)) : 0),
+    [notes]
+  );
+
+  // Tuner display (still summary of last analysis; not live)
   const latest = frames.length ? frames[frames.length - 1] : null;
   const latestMidiName = useMemo(() => {
     if (!latest?.f0) return "--";
@@ -48,6 +65,10 @@ export default function Home() {
     return () => {
       stopPlayback(true);
       stopRecording(true);
+      try {
+        audioCtxRef.current?.close();
+      } catch {}
+      audioCtxRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -59,22 +80,19 @@ export default function Home() {
       setStatus("Instrument changed. Press Play to listen with the new instrument.");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [synth]);
+  }, [instrumentName]);
 
   async function startRecording() {
     try {
-      // Reset old state
       clearRecording();
-
       setStatus("Requesting microphone…");
 
-      // Better mic constraints (helps pitch)
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true
-        }
+          autoGainControl: true,
+        },
       });
 
       streamRef.current = stream;
@@ -93,11 +111,9 @@ export default function Home() {
       };
 
       mr.onstop = () => {
-        // Stop mic tracks
         stream.getTracks().forEach((t) => t.stop());
         streamRef.current = null;
 
-        // Stop timer
         if (timerRef.current) {
           window.clearInterval(timerRef.current);
           timerRef.current = null;
@@ -105,7 +121,6 @@ export default function Home() {
 
         const blob = new Blob(recChunksRef.current, { type: mr.mimeType || "audio/webm" });
 
-        // If blob is tiny, it likely didn’t record
         if (blob.size < 1500) {
           setStatus("Recording was empty. Please allow mic permission and try again.");
           setMode("idle");
@@ -117,14 +132,13 @@ export default function Home() {
         setMode("idle");
       };
 
-      // Start recorder with timeslice for reliability (important!)
+      // IMPORTANT: timeslice improves reliability
       mr.start(250);
 
       setElapsed(0);
       setMode("recording");
       setStatus("Recording… (max 10s)");
 
-      // Start visible timer + auto-stop at MAX_RECORD_SECONDS
       timerRef.current = window.setInterval(() => {
         setElapsed((prev) => {
           const next = prev + 0.1;
@@ -135,7 +149,6 @@ export default function Home() {
           return next;
         });
       }, 100);
-
     } catch (e) {
       setStatus("Mic permission denied or unavailable. Please allow microphone access and retry.");
       setMode("idle");
@@ -145,17 +158,17 @@ export default function Home() {
   function stopRecording(force: boolean) {
     const mr = mediaRecRef.current;
     if (mr && mr.state !== "inactive") {
-      try { mr.stop(); } catch {}
+      try {
+        mr.stop();
+      } catch {}
     }
     mediaRecRef.current = null;
 
-    // Stop timer
     if (timerRef.current) {
       window.clearInterval(timerRef.current);
       timerRef.current = null;
     }
 
-    // Stop stream if force stop
     if (force && streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
@@ -165,7 +178,6 @@ export default function Home() {
   }
 
   function clearRecording() {
-    // Stop any playing audio too
     stopPlayback(true);
 
     setRecordedBlob(null);
@@ -195,7 +207,6 @@ export default function Home() {
 
     const { samples, sampleRate, duration } = await decodeAudioToMono(blob, 44100);
 
-    // For mic recordings, short is better
     if (duration > 30) {
       setStatus(`Clip is ${duration.toFixed(1)}s. For best results, use <= 30s (monophonic).`);
     } else {
@@ -208,8 +219,6 @@ export default function Home() {
     const fMax = 1200;
 
     const outFrames: PitchFrame[] = [];
-
-    // A slightly higher silence gate helps mic noise
     const silenceGate = 0.010;
 
     for (let i = 0; i + frameSize < samples.length; i += hop) {
@@ -232,9 +241,9 @@ export default function Home() {
     const outNotes = framesToNotes(outFrames, {
       minRms: 0.012,
       minConf: 0.22,
-      minNoteDur: 0.10,
+      minNoteDur: 0.1,
       mergeGap: 0.06,
-      pitchTolerance: 0.5
+      pitchTolerance: 0.5,
     });
 
     setNotes(outNotes);
@@ -248,7 +257,13 @@ export default function Home() {
     }
   }
 
-  // ---------------- Playback (Play / Pause) ----------------
+  // ---------------- BPM/Quantize ----------------
+
+  const notesForPlayback = useMemo(() => {
+    return quantizeNotes(notes, bpm, quantize);
+  }, [notes, bpm, quantize]);
+
+  // ---------------- Playback (SoundFont) ----------------
 
   function ensureAudioCtx(): AudioContext {
     if (audioCtxRef.current && audioCtxRef.current.state !== "closed") return audioCtxRef.current;
@@ -256,70 +271,75 @@ export default function Home() {
     return audioCtxRef.current;
   }
 
+  async function getInstrument(ctx: AudioContext, name: string) {
+    // reuse if same instrument already loaded
+    if (instrumentRef.current && instrumentRef.current.name === name) return instrumentRef.current;
+
+    // if a load is ongoing, wait for it
+    if (loadingInstrumentRef.current) {
+      await loadingInstrumentRef.current;
+      if (instrumentRef.current && instrumentRef.current.name === name) return instrumentRef.current;
+    }
+
+    setStatus(`Loading instrument: ${name.replaceAll("_", " ")}…`);
+    loadingInstrumentRef.current = Soundfont.instrument(ctx, name);
+    const inst = await loadingInstrumentRef.current;
+    loadingInstrumentRef.current = null;
+
+    instrumentRef.current = inst;
+    setStatus("Ready");
+    return inst;
+  }
+
   function stopPlayback(resetOffset: boolean) {
-    // Stop scheduled nodes
-    for (const node of playingNodesRef.current) {
-      try { node.osc.stop(); } catch {}
-      try { node.osc.disconnect(); } catch {}
-      try { node.gain.disconnect(); } catch {}
+    const nodes = playingNodesRef.current;
+    for (const node of nodes) {
+      try {
+        node.stop();
+      } catch {}
+      try {
+        node.disconnect?.();
+      } catch {}
     }
     playingNodesRef.current = [];
     setIsPlaying(false);
-
-    // Preserve pause offset unless reset
     if (resetOffset) playOffsetRef.current = 0;
   }
 
-  function play() {
-    if (!notes.length) return;
-
-    // If already playing, ignore
+  async function play() {
+    if (!notesForPlayback.length) return;
     if (isPlaying) return;
 
-    const ctx = ensureAudioCtx();
-    const offset = Math.max(0, Math.min(playOffsetRef.current, pieceDuration));
+    stopPlayback(false);
 
-    // schedule from offset
+    const ctx = ensureAudioCtx();
+    const inst = await getInstrument(ctx, instrumentName);
+
+    const offset = Math.max(0, Math.min(playOffsetRef.current, pieceDuration));
     const now = ctx.currentTime + 0.03;
     playStartWallRef.current = performance.now();
 
-    const nodes: { osc: OscillatorNode; gain: GainNode }[] = [];
+    const nodes: any[] = [];
 
-    for (const n of notes) {
-      // Skip notes before offset
+    for (const n of notesForPlayback) {
       if (n.end <= offset) continue;
 
       const start = Math.max(0, n.start - offset);
-      const end = Math.max(0, n.end - offset);
+      const dur = Math.max(0.05, n.end - n.start);
+      const when = now + start;
 
-      const osc = ctx.createOscillator();
-      osc.type = synth;
-
-      const gain = ctx.createGain();
-      const vel = (n.velocity / 127) * 0.6;
-
-      gain.gain.setValueAtTime(0, now + start);
-      gain.gain.linearRampToValueAtTime(vel, now + start + 0.01);
-      gain.gain.setValueAtTime(vel, now + Math.max(start + 0.01, end - 0.05));
-      gain.gain.linearRampToValueAtTime(0, now + end);
-
-      osc.frequency.setValueAtTime(midiToHz(n.midi), now + start);
-
-      osc.connect(gain).connect(ctx.destination);
-      osc.start(now + start);
-      osc.stop(now + end + 0.02);
-
-      nodes.push({ osc, gain });
+      const velocity = Math.max(0.05, Math.min(1, n.velocity / 127));
+      const node = inst.play(n.midi, when, { duration: dur, gain: velocity });
+      nodes.push(node);
     }
 
     playingNodesRef.current = nodes;
     setIsPlaying(true);
     setStatus("Playing…");
 
-    // Auto-finish: stop and reset when done
     const remaining = Math.max(0, pieceDuration - offset) + 0.25;
     window.setTimeout(() => {
-      // If user already paused/stopped, ignore
+      // if already paused/stopped
       if (!isPlaying) return;
       stopPlayback(true);
       setStatus("Ready");
@@ -329,7 +349,6 @@ export default function Home() {
   function pause() {
     if (!isPlaying) return;
 
-    // Update offset based on time since play started
     const elapsedWall = (performance.now() - playStartWallRef.current) / 1000;
     playOffsetRef.current = Math.min(pieceDuration, playOffsetRef.current + elapsedWall);
 
@@ -344,14 +363,20 @@ export default function Home() {
   }
 
   function exportMidi() {
-    if (!notes.length) return;
-    downloadMidi(notes, bpm, "conversion.mid");
+    if (!notesForPlayback.length) return;
+    downloadMidi(notesForPlayback, bpm, "conversion.mid");
   }
 
   async function exportWav() {
-    if (!notes.length) return;
+    if (!notesForPlayback.length) return;
+    // NOTE: WAV export uses synth-based renderer (existing lib), not SoundFont yet.
     setStatus("Rendering WAV (offline)…");
-    const blob = await renderNotesToWavBlob({ notes, bpm, synth });
+    const blob = await renderNotesToWavBlob({
+      notes: notesForPlayback,
+      bpm,
+      // renderNotesToWavBlob still uses a simple synth; keep it as-is for demo
+      // instrument realism is in playback; MIDI export is also realistic.
+    } as any);
     downloadBlob(blob, "conversion.wav");
     setStatus("Ready");
   }
@@ -359,9 +384,7 @@ export default function Home() {
   return (
     <main style={{ maxWidth: 980, margin: "0 auto", padding: 24, fontFamily: "system-ui, sans-serif" }}>
       <h1 style={{ marginBottom: 8 }}>Tuner → Instrument Converter (Browser-only Demo)</h1>
-      <p style={{ marginTop: 0, color: "#444" }}>
-        Record or upload a <b>single-voice / single-instrument</b> melody.
-      </p>
+      <p style={{ marginTop: 0, color: "#444" }}>Record or upload a <b>single-voice / single-instrument</b> melody.</p>
 
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center", marginBottom: 16 }}>
         <button
@@ -380,7 +403,7 @@ export default function Home() {
             onChange={(e) => {
               const f = e.target.files?.[0];
               if (f) handleUpload(f);
-              e.currentTarget.value = ""; // allow re-upload same file
+              e.currentTarget.value = "";
             }}
           />
         </label>
@@ -412,7 +435,7 @@ export default function Home() {
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
         <section style={{ border: "1px solid #eee", borderRadius: 14, padding: 16 }}>
-          <h3 style={{ marginTop: 0 }}>Tuner View</h3>
+          <h3 style={{ marginTop: 0 }}>Tuner View (summary of last analysis)</h3>
           <div style={{ display: "flex", gap: 16, alignItems: "center" }}>
             <div style={{ fontSize: 42, fontWeight: 700 }}>{latestMidiName}</div>
             <div style={{ color: "#666" }}>
@@ -438,22 +461,36 @@ export default function Home() {
               </label>
 
               <label>
-                Instrument (demo synth)&nbsp;
-                <select
-                  value={synth}
-                  onChange={(e) => setSynth(e.target.value as SynthType)}
-                >
-                  <option value="triangle">Flute-ish (triangle)</option>
-                  <option value="sine">Pure (sine)</option>
-                  <option value="sawtooth">Synth lead (saw)</option>
-                  <option value="square">Chiptune (square)</option>
+                Quantize&nbsp;
+                <select value={quantize} onChange={(e) => setQuantize(e.target.value as QuantizeGrid)}>
+                  <option value="off">Off</option>
+                  <option value="1/8">1/8</option>
+                  <option value="1/16">1/16</option>
+                </select>
+              </label>
+
+              <label>
+                Instrument&nbsp;
+                <select value={instrumentName} onChange={(e) => setInstrumentName(e.target.value)}>
+                  <option value="acoustic_grand_piano">Piano (Acoustic)</option>
+                  <option value="electric_piano_1">Electric Piano</option>
+                  <option value="harpsichord">Harpsichord</option>
+                  <option value="acoustic_guitar_nylon">Guitar (Nylon)</option>
+                  <option value="acoustic_guitar_steel">Guitar (Steel)</option>
+                  <option value="violin">Violin</option>
+                  <option value="cello">Cello</option>
+                  <option value="flute">Flute</option>
+                  <option value="clarinet">Clarinet</option>
+                  <option value="trumpet">Trumpet</option>
+                  <option value="synth_brass_1">Synth Brass</option>
+                  <option value="lead_1_square">Lead (Square)</option>
                 </select>
               </label>
             </div>
           </div>
 
           <small style={{ display: "block", marginTop: 12, color: "#777" }}>
-            Tip: hum clearly, steady tone, minimal background noise. Keep clips ≤ 10s for mic demos.
+            BPM now affects playback via quantization (grid snapping). Realistic instruments are SoundFont-based.
           </small>
         </section>
 
@@ -463,7 +500,7 @@ export default function Home() {
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
             <button
               onClick={isPlaying ? pause : play}
-              disabled={!notes.length}
+              disabled={!notesForPlayback.length}
               style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #ccc", cursor: "pointer" }}
             >
               {isPlaying ? "Pause" : "Play"}
@@ -471,7 +508,7 @@ export default function Home() {
 
             <button
               onClick={stop}
-              disabled={!notes.length}
+              disabled={!notesForPlayback.length}
               style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #ccc", cursor: "pointer" }}
             >
               Stop
@@ -479,7 +516,7 @@ export default function Home() {
 
             <button
               onClick={exportMidi}
-              disabled={!notes.length}
+              disabled={!notesForPlayback.length}
               style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #ccc", cursor: "pointer" }}
             >
               Export MIDI
@@ -487,7 +524,7 @@ export default function Home() {
 
             <button
               onClick={exportWav}
-              disabled={!notes.length}
+              disabled={!notesForPlayback.length}
               style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #ccc", cursor: "pointer" }}
             >
               Export WAV
@@ -506,7 +543,7 @@ export default function Home() {
                 </tr>
               </thead>
               <tbody>
-                {notes.slice(0, 200).map((n, i) => (
+                {notesForPlayback.slice(0, 200).map((n, i) => (
                   <tr key={i}>
                     <td style={td}>{i + 1}</td>
                     <td style={td}>{midiToName(n.midi)}</td>
@@ -515,7 +552,7 @@ export default function Home() {
                     <td style={td}>{n.velocity}</td>
                   </tr>
                 ))}
-                {!notes.length && (
+                {!notesForPlayback.length && (
                   <tr>
                     <td style={{ ...td, padding: 14 }} colSpan={5}>
                       No notes yet. Record/upload a monophonic melody, then analyze.
@@ -527,7 +564,7 @@ export default function Home() {
           </div>
 
           <small style={{ display: "block", marginTop: 10, color: "#777" }}>
-            Press Play to hear the selected instrument.
+            Instrument changes won’t auto-play. Press Play to hear the selected instrument.
           </small>
         </section>
       </div>
@@ -535,8 +572,24 @@ export default function Home() {
   );
 }
 
-function midiToHz(m: number): number {
-  return 440 * Math.pow(2, (m - 69) / 12);
+// ---------------- Helpers ----------------
+
+function quantizeNotes(notes: NoteEvent[], bpm: number, grid: QuantizeGrid): NoteEvent[] {
+  if (grid === "off") return notes;
+
+  const beatsPerSec = bpm / 60;
+  const secPerBeat = 1 / beatsPerSec;
+
+  const div = grid === "1/8" ? 2 : 4; // 1/8 -> 2 per beat; 1/16 -> 4 per beat
+  const step = secPerBeat / div;
+
+  const q = (t: number) => Math.round(t / step) * step;
+
+  return notes.map((n) => {
+    const s = q(n.start);
+    const e = Math.max(s + step, q(n.end));
+    return { ...n, start: s, end: e };
+  });
 }
 
 const th: React.CSSProperties = {
